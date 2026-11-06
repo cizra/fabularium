@@ -19,6 +19,9 @@
  */
 package com.luxlunae.glk.model.stream.window;
 
+import android.content.Context;
+import android.content.SharedPreferences;
+
 import android.graphics.Paint;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -90,6 +93,13 @@ public class GLKTextBufferM extends GLKTextWindowM {
         ret = FIND_SINGLE_QUOTE.matcher(ret).replaceAll(REPLACE_SINGLE_QUOTE);
         ret = FIND_DOUBLE_QUOTES.matcher(ret).replaceAll(REPLACE_DOUBLE_QUOTES);
         return ret;
+    }
+
+    @Nullable
+    public SharedPreferences getReadingPositionPreferences() {
+        if (getRock() != 1 || mModel.mAutosaveFile == null || !mModel.mAutosaveFile.exists()) return null;
+        return mModel.getApplicationContext().getSharedPreferences(
+                "scrollback-" + mModel.mAutosaveFile.getName(), Context.MODE_PRIVATE);
     }
 
     public boolean hasShownHTML() {

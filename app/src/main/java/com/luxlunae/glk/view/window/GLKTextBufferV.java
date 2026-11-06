@@ -23,12 +23,14 @@ import android.annotation.SuppressLint;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.graphics.Canvas;
 import android.graphics.Path;
 import android.graphics.Point;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
+import android.util.Base64;
 import android.text.DynamicLayout;
 import android.text.Layout;
 import android.text.Layout.Alignment;
@@ -55,6 +57,9 @@ import com.luxlunae.glk.model.style.GLKStyleSpan;
 import com.luxlunae.glk.model.html.TableSpan;
 
 import java.util.ArrayList;
+import java.nio.charset.Charset;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 import static com.luxlunae.glk.model.stream.window.GLKWindowM.ModifierFlag.FLAG_BG_COLOR_CHANGED;
 import static com.luxlunae.glk.model.stream.window.GLKWindowM.ModifierFlag.FLAG_CLEARED;
@@ -86,6 +91,16 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
     private boolean mAcceptingBufferedInput = true;
     @Nullable
     private String mLastFlush;
+    private int mCommandStart;
+    private int mResponseStart;
+    private boolean mAwaitingResponse = true;
+    private boolean mReadingPositionRestored;
+    private final Runnable mSaveReadingPosition = new Runnable() {
+        @Override
+        public void run() {
+            saveReadingPosition(false);
+        }
+    };
 
     public GLKTextBufferV(@NonNull Context c, @NonNull GLKTextBufferM model, @NonNull GLKScreen screen,
                           @Nullable int[] vScrollbarColors, @Nullable int[] hScrollbarColors,
@@ -151,6 +166,23 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
         boolean atEnd = isAtEnd();
         super.onSizeChanged(w, h, oldw, oldh);
         updateScroll(atEnd);
+        positionResponse();
+        restoreReadingPosition();
+        saveReadingPosition(true);
+        queueReadingPositionSave();
+    }
+
+    @Override
+    protected void onScrollChanged(int x, int y, int oldx, int oldy) {
+        super.onScrollChanged(x, y, oldx, oldy);
+        queueReadingPositionSave();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        removeCallbacks(mSaveReadingPosition);
+        saveReadingPosition(false);
+        super.onDetachedFromWindow();
     }
 
     @Override
@@ -259,6 +291,8 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
             setScrollX(0);
             setScrollY(0);
             mModel.clearFlag(FLAG_CLEARED);
+            mCommandStart = mResponseStart = 0;
+            mAwaitingResponse = true;
         }
 
         // If there's nothing to flush, then return
@@ -286,10 +320,8 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
             mLastFlush = mOutputBuffer.toString().trim();
             mLastFlush = mLastFlush.replaceAll(">\\Z", "What now?");
             if (mLastFlush != null) {
-                Context c = getContext();
-                if (c instanceof GLKActivity) {
-                    ((GLKActivity) c).speakText(mLastFlush);
-                }
+                GLKActivity activity = GLKUtils.getActivityForView(this);
+                if (activity != null) activity.speakText(mLastFlush);
 
                 // Also ensure we announce this to users that have accessibility enabled
                 // (e.g. Google TalkBack)
@@ -310,6 +342,7 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
         }
 
         updateScroll(atEnd);
+        queueReadingPositionSave();
         invalidate();
     }
 
@@ -334,6 +367,9 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
             }
             mCurLineEvent = -1;
         }
+        positionResponse();
+        restoreReadingPosition();
+        saveReadingPosition(true);
     }
 
     /**
@@ -416,6 +452,7 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
      */
     private void stopComposing(boolean userTerminated) {
         boolean atEnd = isAtEnd();
+        if (userTerminated) beginResponse();
         mComposing = false;
         if (mModel.showCompletedInput()) {
             int len = mOutput.length();
@@ -431,7 +468,83 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
             clearInput();
         }
         mOutput.removeSpan(InputMarker.class);
+        if (userTerminated) mResponseStart = mOutput.length();
         updateScroll(atEnd);
+    }
+
+    public void beginResponse() {
+        int input = mOutput.getSpanStart(InputMarker.class);
+        mCommandStart = Math.max(0, (input >= 0 ? input : mOutput.length()) - 1);
+        mResponseStart = mOutput.length();
+        mAwaitingResponse = true;
+        scrollToEnd();
+    }
+
+    private void positionResponse() {
+        if (!mAwaitingResponse || mLayout == null || mHeightLessPadding <= 0 ||
+                !(mModel.lineRequested() || mModel.charRequested()) || mOutput.length() <= mResponseStart) return;
+        int firstLine = mLayout.getLineForOffset(Math.min(mResponseStart, mOutput.length()));
+        if (mLayout.getHeight() - mLayout.getLineTop(firstLine) > mHeightLessPadding) {
+            int commandLine = mLayout.getLineForOffset(Math.min(mCommandStart, mOutput.length()));
+            scrollTo(getScrollX(), mVOffset + mLayout.getLineTop(commandLine));
+        }
+        mAwaitingResponse = false;
+    }
+
+    private int transcriptEnd() {
+        int input = mOutput.getSpanStart(InputMarker.class);
+        return input >= 0 ? input : mOutput.length();
+    }
+
+    private String transcriptFingerprint() {
+        int end = transcriptEnd();
+        // match Bocfel's 32K snapshot; expand both for longer retained history.
+        String text = mOutput.subSequence(Math.max(0, end - 32768), end).toString();
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256").digest(text.getBytes(Charset.forName("UTF-8")));
+            return Base64.encodeToString(hash, Base64.NO_WRAP);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new AssertionError(impossible); // SHA-256 is mandatory on Android.
+        }
+    }
+
+    private void queueReadingPositionSave() {
+        if (mSaveReadingPosition == null) return;
+        removeCallbacks(mSaveReadingPosition);
+        postDelayed(mSaveReadingPosition, 5000);
+    }
+
+    private void saveReadingPosition(boolean onlyIfTextChanged) {
+        if (!mReadingPositionRestored || mLayout == null || mHeightLessPadding <= 0) return;
+        SharedPreferences prefs = mModel.getReadingPositionPreferences();
+        if (prefs == null) return;
+        String snapshot = transcriptFingerprint();
+        if (onlyIfTextChanged && snapshot.equals(prefs.getString("snapshot", null))) return;
+        int y = Math.max(0, getScrollY() - mVOffset);
+        int line = mLayout.getLineForVertical(y);
+        int end = transcriptEnd();
+        int distance = end - Math.min(end, mLayout.getLineStart(line));
+        prefs.edit().putString("snapshot", snapshot).putBoolean("bottom", isAtEnd())
+                .putInt("distance", Math.min(32768, distance))
+                .putInt("offset", y - mLayout.getLineTop(line)).apply();
+    }
+
+    private void restoreReadingPosition() {
+        if (mReadingPositionRestored || mLayout == null || mHeightLessPadding <= 0 ||
+                !(mModel.lineRequested() || mModel.charRequested())) return;
+        mReadingPositionRestored = true;
+        SharedPreferences prefs = mModel.getReadingPositionPreferences();
+        if (prefs == null || !transcriptFingerprint().equals(prefs.getString("snapshot", null))) return;
+        if (prefs.getBoolean("bottom", false)) {
+            scrollToEnd();
+        } else {
+            int end = transcriptEnd();
+            int distance = Math.max(0, Math.min(Math.min(32768, end), prefs.getInt("distance", 0)));
+            int line = mLayout.getLineForOffset(end - distance);
+            int height = mLayout.getLineBottom(line) - mLayout.getLineTop(line);
+            int offset = Math.max(0, Math.min(Math.max(0, height - 1), prefs.getInt("offset", 0)));
+            scrollTo(getScrollX(), mVOffset + mLayout.getLineTop(line) + offset);
+        }
     }
 
     private boolean isAtEnd() {
@@ -600,7 +713,9 @@ public class GLKTextBufferV extends GLKTextWindowV implements HVScrollView.Scrol
             }
             drawInput();
             scrollToEnd();
+            beginResponse();
             stopComposing(false);
+            mResponseStart = mOutput.length();
 
             // post the event
             // val2 will be 0 unless input was ended by a special terminator key, in which case val2 will
