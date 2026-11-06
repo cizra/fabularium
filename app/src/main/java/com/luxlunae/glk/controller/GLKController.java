@@ -2874,6 +2874,9 @@ public final class GLKController {
                                 win.cancelCharEvent();
                                 break;
                             case GLKConstants.evtype_LineInput:
+                                if (win instanceof GLKTextBufferM) {
+                                    ((GLKTextBufferM) win).rememberCommand(e.val1);
+                                }
                                 win.cancelLineEvent(null);
                                 break;
                         }

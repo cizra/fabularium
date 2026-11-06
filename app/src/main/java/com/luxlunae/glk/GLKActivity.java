@@ -763,6 +763,9 @@ public class GLKActivity extends FragmentActivity
 
     @Override
     public boolean dispatchKeyEvent(@NonNull KeyEvent event) {
+        GLKWindowV historyFocus = mScreen == null ? null : mScreen.getFocusedWindow();
+        if (historyFocus instanceof GLKTextBufferV &&
+                ((GLKTextBufferV) historyFocus).onInputKey(event)) return true;
         if (mModel != null && mModel.mUsingHardwareKeyboard) {
             if (event.getAction() == KeyEvent.ACTION_UP) {
                 int keyCode = event.getKeyCode();
